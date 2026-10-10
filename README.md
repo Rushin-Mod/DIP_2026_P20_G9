@@ -1,4 +1,4 @@
-# DIP_2026_P20_G9
+# DIP_2026_P20_G9 The Medics
 
 ECE501 Digital Image Processing Project
 
