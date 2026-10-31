@@ -1,1 +1,42 @@
+# Week 5 – Further Ideation and Scaling Based on Python
 
+**Project:** Brain MRI Tumor Segmentation and Quantitative Analysis Using Classical Image Processing  
+**Course:** ECE501 - Digital Image Processing  
+**Group:** G9 - The Medics
+
+## Team
+- Kush Kelaiya — AU2440018
+- Rushin Modi — AU2440028
+- Kritee Shah — AU2440080
+- Jash Odedara — AU2440096
+
+## Work Completed
+- Reviewed the project approach following the mid-semester review and discussed further improvements with Prof. Mehul Raval.
+- Explored different baseline MRI scans through multiple iterations to understand their impact on tumor detection results.
+- Introduced user-based target scan selection instead of automatically using the first scan as the baseline.
+- Investigated preprocessing techniques in Python before transitioning to C++.
+- Explored converting MRI image data from `float64` to `uint16` to improve computational efficiency during subtraction.
+- Identified dimension mismatches, voxel-axis ordering inconsistencies, and intensity normalization issues affecting MRI subtraction.
+- Investigated alignment problems caused by resampling scans without proper anatomical registration.
+- Worked on scaling and aligning MRI scans with different dimensions using Python.
+- Implemented subtraction testing using CUDA C++ and achieved partial success in accurately subtracting brain regions from baseline images.
+
+## Tools and Technologies
+- Python
+- C++
+- CUDA
+- MRI Image Processing
+- Image Scaling and Alignment
+- Voxel-Based Processing
+
+## Next Week
+- Complete the remaining preprocessing and alignment tasks in Python.
+- Transition computationally intensive processing stages to C++ using CUDA.
+- Implement baseline formation and subtraction on updated MRI scans.
+- Test the processing pipeline on multiple patient scans.
+- Bring processed results back into Python for further analysis and validation.
+- Improve tumor region detection and highlighting across multiple MRI scans.
+- Explore the development of an interactive GUI for doctors and patients.
+
+## Files
+- `Week5_G9.pdf`
