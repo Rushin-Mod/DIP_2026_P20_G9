@@ -1,1 +1,38 @@
 
+# Week 4 – Conversion of MRI Images to Binary Using Python
+
+**Project:** Brain MRI Tumor Segmentation and Quantitative Analysis Using Classical Image Processing  
+**Course:** ECE501 - Digital Image Processing  
+**Group:** G9 - The Medics
+
+## Team
+- Kush Kelaiya — AU2440018
+- Rushin Modi — AU2440028
+- Kritee Shah — AU2440080
+- Jash Odedara — AU2440096
+
+## Work Completed
+- Converted the entire MRI image series into binary format for more efficient processing.
+- Explored different filtering techniques using concepts learned in the course.
+- Identified MRI scans without visible tumors and used them as baseline images for comparison with other scans.
+- Converted image data from `float64` to unsigned 16-bit integer (`uint16`) to reduce computational requirements.
+- Processed MRI scans consisting of 144 slices, each with dimensions of 256 × 256.
+- Implemented slice-by-slice analysis across the three different MRI views to help reduce false positives and false negatives.
+- Examined voxel matrices and identified computational challenges associated with processing large MRI volumes.
+- Explored the possibility of using C++ for more efficient processing of binary MRI data.
+
+## Tools and Technologies
+- Python
+- MRI image processing libraries
+- Binary image representation
+- C++
+
+## Next Week
+- Implement the binary MRI processing workflow in C++.
+- Test the implementation on individual MRI scans before extending it to multiple scans.
+- Compare the accuracy of Python and C++ implementations.
+- Improve the segmentation process to identify tumor regions more effectively.
+- Explore ways to integrate Python and C++ implementations.
+
+## Files
+- `Week4_G9.pdf`
