@@ -1,10 +1,10 @@
-# Brain MRI Tumor Detection (Attempt 2 - v2 / new_code_v3)
+# Brain MRI Tumor Detection (Attempt 3 - Final C++/CUDA Engine)
 
-This folder contains the updated image processing pipeline for baseline atlas generation, tumor detection, and visualization.
+This folder contains the complete classical image processing pipeline for baseline atlas generation, 3D tumor detection, and visualization.
 
 ## Files
 - `calculate_baseline.cu`: CUDA program for computing voxel-wise mean and standard deviation atlas volumes across baseline scans.
-- `detect_tumor.cu`: CUDA program using canonical bounding-box alignment, 14-hemisphere baseline atlas scoring, ventricular horn suppression, and contralateral-guided level-set segmentation.
+- `detect_tumor.cu`: Standalone C++/CUDA detection program implementing brain extraction, canonical bounding-box affine alignment, 14-hemisphere baseline atlas anomaly scoring, and contralateral-guided level-set segmentation in GPU thread blocks.
 - `preprocess_export.py`: Python script to load NIfTI scans (`.nii.gz`), apply skull-stripping, and export them into 18-byte header `.bin` volumes.
 - `visualize_results.py`: Python visualizer to generate multi-planar (Axial, Coronal, Sagittal) `.png` slice views and cohort overview montages.
 - `verify_py.py`: Python script for checking output volumes.
