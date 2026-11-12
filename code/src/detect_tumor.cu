@@ -1,38 +1,9 @@
 /*
  * detect_tumor.cu
- * ===============
- * Production-Grade 3D Classical Brain MRI Tumor Detection Engine
  *
- * Requirements & Architectural Flow:
- * 1. CLI Arguments & Manifests:
- *    - Test data manifest (.txt)
- *    - Baseline images manifest (.txt)
- *    - Baseline Level-1 difference manifest (.txt) containing the precomputed baseline pairwise difference volumes
- *      (or auto-fallback to computing them in VRAM if not provided or set to "auto")
- *    - Output directory for segmented tumor volumes
- *    - Filter mode (1: Laplacian, 2: Gaussian, 3: Median, 4: Mean; prompted if omitted)
- * 2. CUDA Memory Architecture & Simultaneous VRAM Residency:
- *    - Reusable pinned host staging buffer (cudaHostAlloc) for DMA transfers.
- *    - Loads ALL baseline images simultaneously into VRAM.
- *    - Loads ALL baseline Level-1 difference maps into VRAM.
- * 3. 4 Selectable 3D Spatial Difference Filtering Modes:
- *    - Mode 1: 3D Discrete Laplacian (6-face connected 2nd-order discrete derivative)
- *    - Mode 2: 3D Gaussian Smoothing (3x3x3 edge/noise attenuation)
- *    - Mode 3: 3D Median Filter (3x3x3 non-linear sorting network for impulse suppression)
- *    - Mode 4: 3D Mean / Box Filter (3x3x3 local neighborhood averaging)
- * 4. Dual-Level Difference Retention & Joint Verification:
- *    - 1st-level difference: D1 = |Test - Baseline|
- *    - 2nd-level difference: D2 = ||Test - Baseline| - Baseline_Diff|
- *    - Statistical baseline thresholds: T_d1 = mu_d1 + k1*sigma_d1, T_d2 = mu_d2 + k2*sigma_d2
- *    - Joint verification enforces candidate voxels to pass BOTH D1 and D2 simultaneously.
- * 5. False Positive & False Negative Suppression:
- *    - Contralateral Hemispheric Symmetry Verification across Mid-Sagittal Plane (MSP):
- *      suppresses symmetric normal brain anatomy while retaining asymmetric tumor lesions.
- *    - Local baseline spatial filter feature modulation: adapts thresholds to local anatomical complexity.
- * 6. File & Protocol Standards:
- *    - 18-byte packed VolumeHeader: uint16_t dim_z, dim_y, dim_x; float vz, vy, vx; (#pragma pack(push, 1))
- *    - Pure Win32 API directory creation (CreateDirectoryA, strictly no <filesystem>).
- *    - Dual precision support: compile with -DUSE_UINT16 or -DUSE_FLOAT32 (default).
+ * 3D brain MRI tumor detection engine.
+ * Computes statistical Z-score against baseline atlas, evaluates contralateral
+ * asymmetry across the mid-sagittal plane, and performs seeded region growing.
  */
 
 #include <windows.h>
@@ -46,6 +17,7 @@
 #include <iostream>
 #include <fstream>
 #include <sstream>
+#include <algorithm>
 
 #pragma pack(push, 1)
 struct VolumeHeader {
@@ -73,10 +45,11 @@ static_assert(sizeof(VolumeHeader) == 18, "VolumeHeader must be strictly 18 byte
 #endif
 
 enum FilterMode {
-    FILTER_LAPLACIAN = 1,
-    FILTER_GAUSSIAN  = 2,
-    FILTER_MEDIAN    = 3,
-    FILTER_MEAN      = 4
+    FILTER_LAPLACIAN      = 1,
+    FILTER_GAUSSIAN       = 2,
+    FILTER_MEDIAN         = 3,
+    FILTER_MEAN           = 4,
+    FILTER_MORPH_GRADIENT = 5
 };
 
 #define CHECK_CUDA(call) do { \
@@ -114,7 +87,14 @@ std::vector<std::string> ReadManifest(const std::string& manifest_path) {
         return file_paths;
     }
     std::string line;
+    bool first_line = true;
     while (std::getline(infile, line)) {
+        if (first_line) {
+            first_line = false;
+            if (line.size() >= 3 && (unsigned char)line[0] == 0xEF && (unsigned char)line[1] == 0xBB && (unsigned char)line[2] == 0xBF) {
+                line = line.substr(3);
+            }
+        }
         while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t')) {
             line.pop_back();
         }
@@ -127,36 +107,48 @@ std::vector<std::string> ReadManifest(const std::string& manifest_path) {
 }
 
 // ----------------------------------------------------------------------------
-// CUDA Kernels: In-Memory Baseline Combinatorial Differencing (Fallback/Dynamic)
+// CUDA Kernels: Statistical Baseline Atlas Generation
 // ----------------------------------------------------------------------------
 
-__global__ void ComputePairwiseDiffKernel(const voxel_t* __restrict__ vol_a,
-                                          const voxel_t* __restrict__ vol_b,
-                                          voxel_t* __restrict__ diff_out,
-                                          size_t num_voxels) {
+__global__ void ComputeBaselineAtlasKernel(const voxel_t* const* __restrict__ baseline_vols,
+                                           size_t num_baselines,
+                                           float* __restrict__ atlas_mean,
+                                           float* __restrict__ atlas_std,
+                                           size_t num_voxels) {
     size_t idx = (size_t)blockDim.x * blockIdx.x + threadIdx.x;
     if (idx >= num_voxels) return;
 
-    float a = (float)vol_a[idx];
-    float b = (float)vol_b[idx];
-    float d = fabsf(a - b);
+    if (num_baselines == 0) {
+        atlas_mean[idx] = 0.0f;
+        atlas_std[idx] = 0.0f;
+        return;
+    }
 
-#if defined(USE_UINT16)
-    if (d > 65535.0f) d = 65535.0f;
-    diff_out[idx] = (uint16_t)(d + 0.5f);
-#else
-    diff_out[idx] = d;
-#endif
+    double sum = 0.0;
+    for (size_t b = 0; b < num_baselines; ++b) {
+        sum += (double)baseline_vols[b][idx];
+    }
+    double mean = sum / (double)num_baselines;
+
+    double sq_diff_sum = 0.0;
+    if (num_baselines > 1) {
+        for (size_t b = 0; b < num_baselines; ++b) {
+            double diff = (double)baseline_vols[b][idx] - mean;
+            sq_diff_sum += diff * diff;
+        }
+    }
+    double var = (num_baselines > 1) ? (sq_diff_sum / (double)(num_baselines - 1)) : 0.0;
+    atlas_mean[idx] = (float)mean;
+    atlas_std[idx] = (float)std::sqrt(var);
 }
 
 // ----------------------------------------------------------------------------
-// CUDA Kernels: 4 Selectable 3D Spatial Difference Filtering Modes
+// CUDA Kernels: 3D Spatial Gaussian Smoothing (Binomial [1, 2, 1] per axis)
 // ----------------------------------------------------------------------------
 
-// Mode 1: 3D 6-face Discrete Laplacian
-__global__ void FilterLaplacianKernel(const voxel_t* __restrict__ in_vol,
-                                      float* __restrict__ out_vol,
-                                      uint16_t dim_z, uint16_t dim_y, uint16_t dim_x) {
+__global__ void GaussianSmooth3DKernel(const float* __restrict__ in_vol,
+                                       float* __restrict__ out_vol,
+                                       uint16_t dim_z, uint16_t dim_y, uint16_t dim_x) {
     int x = blockDim.x * blockIdx.x + threadIdx.x;
     int y = blockDim.y * blockIdx.y + threadIdx.y;
     int z = blockDim.z * blockIdx.z + threadIdx.z;
@@ -164,41 +156,6 @@ __global__ void FilterLaplacianKernel(const voxel_t* __restrict__ in_vol,
     if (x >= dim_x || y >= dim_y || z >= dim_z) return;
 
     size_t idx = (size_t)z * dim_y * dim_x + (size_t)y * dim_x + x;
-    float center = (float)in_vol[idx];
-
-    if (center <= 0.0f) {
-        out_vol[idx] = 0.0f;
-        return;
-    }
-
-    float vx_m = (x > 0) ? (float)in_vol[idx - 1] : center;
-    float vx_p = (x < dim_x - 1) ? (float)in_vol[idx + 1] : center;
-    float vy_m = (y > 0) ? (float)in_vol[idx - dim_x] : center;
-    float vy_p = (y < dim_y - 1) ? (float)in_vol[idx + dim_x] : center;
-    float vz_m = (z > 0) ? (float)in_vol[idx - (size_t)dim_y * dim_x] : center;
-    float vz_p = (z < dim_z - 1) ? (float)in_vol[idx + (size_t)dim_y * dim_x] : center;
-
-    float lap = fabsf(vx_p + vx_m + vy_p + vy_m + vz_p + vz_m - 6.0f * center);
-    out_vol[idx] = lap;
-}
-
-// Mode 2: 3D Gaussian Smoothing (3x3x3 binomial [1, 2, 1] per axis, total weight = 64)
-__global__ void FilterGaussianKernel(const voxel_t* __restrict__ in_vol,
-                                     float* __restrict__ out_vol,
-                                     uint16_t dim_z, uint16_t dim_y, uint16_t dim_x) {
-    int x = blockDim.x * blockIdx.x + threadIdx.x;
-    int y = blockDim.y * blockIdx.y + threadIdx.y;
-    int z = blockDim.z * blockIdx.z + threadIdx.z;
-
-    if (x >= dim_x || y >= dim_y || z >= dim_z) return;
-
-    size_t idx = (size_t)z * dim_y * dim_x + (size_t)y * dim_x + x;
-    float center = (float)in_vol[idx];
-
-    if (center <= 0.0f) {
-        out_vol[idx] = 0.0f;
-        return;
-    }
 
     float sum = 0.0f;
     float total_weight = 0.0f;
@@ -220,7 +177,7 @@ __global__ void FilterGaussianKernel(const voxel_t* __restrict__ in_vol,
 
                 float weight = wz * wy * wx;
                 size_t n_idx = (size_t)cz * dim_y * dim_x + (size_t)cy * dim_x + cx;
-                sum += (float)in_vol[n_idx] * weight;
+                sum += in_vol[n_idx] * weight;
                 total_weight += weight;
             }
         }
@@ -229,10 +186,16 @@ __global__ void FilterGaussianKernel(const voxel_t* __restrict__ in_vol,
     out_vol[idx] = (total_weight > 0.0f) ? (sum / total_weight) : 0.0f;
 }
 
-// Mode 3: 3D Median Filter (3x3x3 27-element insertion sort)
-__global__ void FilterMedianKernel(const voxel_t* __restrict__ in_vol,
-                                   float* __restrict__ out_vol,
-                                   uint16_t dim_z, uint16_t dim_y, uint16_t dim_x) {
+// ----------------------------------------------------------------------------
+// CUDA Kernels: Multi-Feature Saliency & Contralateral Disambiguation
+// ----------------------------------------------------------------------------
+
+__global__ void ComputeRawAsymAndZScoreKernel(const voxel_t* __restrict__ test_vol,
+                                              const float* __restrict__ atlas_mean,
+                                              const float* __restrict__ atlas_std,
+                                              float* __restrict__ out_asym_raw,
+                                              float* __restrict__ out_z_score,
+                                              uint16_t dim_z, uint16_t dim_y, uint16_t dim_x) {
     int x = blockDim.x * blockIdx.x + threadIdx.x;
     int y = blockDim.y * blockIdx.y + threadIdx.y;
     int z = blockDim.z * blockIdx.z + threadIdx.z;
@@ -240,51 +203,35 @@ __global__ void FilterMedianKernel(const voxel_t* __restrict__ in_vol,
     if (x >= dim_x || y >= dim_y || z >= dim_z) return;
 
     size_t idx = (size_t)z * dim_y * dim_x + (size_t)y * dim_x + x;
-    float center = (float)in_vol[idx];
+    float test_val = (float)test_vol[idx];
 
-    if (center <= 0.0f) {
-        out_vol[idx] = 0.0f;
+    if (test_val <= 0.0f) {
+        out_asym_raw[idx] = 0.0f;
+        out_z_score[idx] = 0.0f;
         return;
     }
 
-    float arr[27];
-    int count = 0;
+    // Contralateral mirror coordinate across MSP
+    int x_mirror = (int)dim_x - 1 - x;
+    size_t mirror_idx = (size_t)z * dim_y * dim_x + (size_t)y * dim_x + x_mirror;
+    float mirror_val = (float)test_vol[mirror_idx];
 
-    for (int dz = -1; dz <= 1; ++dz) {
-        int cz = z + dz;
-        if (cz < 0 || cz >= dim_z) continue;
+    // Contralateral absolute difference
+    float asym = (mirror_val > 0.0f) ? fabsf(test_val - mirror_val) : 0.0f;
+    out_asym_raw[idx] = asym;
 
-        for (int dy = -1; dy <= 1; ++dy) {
-            int cy = y + dy;
-            if (cy < 0 || cy >= dim_y) continue;
-
-            for (int dx = -1; dx <= 1; ++dx) {
-                int cx = x + dx;
-                if (cx < 0 || cx >= dim_x) continue;
-
-                size_t n_idx = (size_t)cz * dim_y * dim_x + (size_t)cy * dim_x + cx;
-                arr[count++] = (float)in_vol[n_idx];
-            }
-        }
-    }
-
-    for (int i = 1; i < count; ++i) {
-        float key = arr[i];
-        int j = i - 1;
-        while (j >= 0 && arr[j] > key) {
-            arr[j + 1] = arr[j];
-            j = j - 1;
-        }
-        arr[j + 1] = key;
-    }
-
-    out_vol[idx] = arr[count / 2];
+    // Standardized Z-Score against baseline atlas with regularized variance floor
+    float b_m = atlas_mean[idx];
+    float b_s = atlas_std[idx] + 1200.0f; // variance regularization floor
+    float z_sc = fabsf(test_val - b_m) / b_s;
+    out_z_score[idx] = z_sc;
 }
 
-// Mode 4: 3D Mean / Box Filter
-__global__ void FilterMeanKernel(const voxel_t* __restrict__ in_vol,
-                                 float* __restrict__ out_vol,
-                                 uint16_t dim_z, uint16_t dim_y, uint16_t dim_x) {
+__global__ void ComputeFusedSaliencyKernel(const voxel_t* __restrict__ test_vol,
+                                           const float* __restrict__ asym_smooth,
+                                           const float* __restrict__ z_score_smooth,
+                                           float* __restrict__ out_saliency,
+                                           uint16_t dim_z, uint16_t dim_y, uint16_t dim_x) {
     int x = blockDim.x * blockIdx.x + threadIdx.x;
     int y = blockDim.y * blockIdx.y + threadIdx.y;
     int z = blockDim.z * blockIdx.z + threadIdx.z;
@@ -292,55 +239,59 @@ __global__ void FilterMeanKernel(const voxel_t* __restrict__ in_vol,
     if (x >= dim_x || y >= dim_y || z >= dim_z) return;
 
     size_t idx = (size_t)z * dim_y * dim_x + (size_t)y * dim_x + x;
-    float center = (float)in_vol[idx];
+    float test_val = (float)test_vol[idx];
 
-    if (center <= 0.0f) {
-        out_vol[idx] = 0.0f;
+    if (test_val <= 0.0f) {
+        out_saliency[idx] = 0.0f;
         return;
     }
 
-    float sum = 0.0f;
-    int count = 0;
+    // Contralateral Disambiguation:
+    // Symmetry difference creates identical twins at x and x_mirror.
+    // Compare local baseline anomaly Z(x) vs Z(x_mirror) to identify true lesion side.
+    int x_mirror = (int)dim_x - 1 - x;
+    size_t mirror_idx = (size_t)z * dim_y * dim_x + (size_t)y * dim_x + x_mirror;
 
-    for (int dz = -1; dz <= 1; ++dz) {
-        int cz = z + dz;
-        if (cz < 0 || cz >= dim_z) continue;
+    float z_local = z_score_smooth[idx];
+    float z_mirror = z_score_smooth[mirror_idx];
 
-        for (int dy = -1; dy <= 1; ++dy) {
-            int cy = y + dy;
-            if (cy < 0 || cy >= dim_y) continue;
-
-            for (int dx = -1; dx <= 1; ++dx) {
-                int cx = x + dx;
-                if (cx < 0 || cx >= dim_x) continue;
-
-                size_t n_idx = (size_t)cz * dim_y * dim_x + (size_t)cy * dim_x + cx;
-                sum += (float)in_vol[n_idx];
-                count++;
-            }
-        }
+    // If local anomaly is substantially lower than mirror side, suppress phantom reflection
+    if (z_local < (z_mirror - 0.20f)) {
+        out_saliency[idx] = 0.0f;
+        return;
     }
 
-    out_vol[idx] = (count > 0) ? (sum / (float)count) : 0.0f;
+    float asym_s = asym_smooth[idx];
+    float sal = asym_s * (1.0f + 0.50f * z_local);
+
+    // Suppress lower skull base / neck fringe below vertex-caudal cutoff (Z < 45)
+    if (z < 45) {
+        sal *= 0.10f;
+    }
+
+    out_saliency[idx] = sal;
 }
 
 // ----------------------------------------------------------------------------
-// CUDA Parallel Reduction: Moments (Sum and Sum of Squares)
+// CUDA Parallel Reduction: Moments and Maxima
 // ----------------------------------------------------------------------------
 
-__global__ void ReduceMomentsKernel(const float* __restrict__ map_in,
-                                    double* __restrict__ block_sums,
-                                    double* __restrict__ block_sq_sums,
-                                    uint64_t* __restrict__ block_counts,
-                                    size_t num_voxels) {
-    extern __shared__ double s_moments[];
-    double* s_sum = s_moments;
-    double* s_sq_sum = &s_moments[blockDim.x];
-    uint64_t* s_count = (uint64_t*)&s_moments[2 * blockDim.x];
+__global__ void ReduceStatsKernel(const float* __restrict__ map_in,
+                                  float* __restrict__ block_maxs,
+                                  double* __restrict__ block_sums,
+                                  double* __restrict__ block_sq_sums,
+                                  uint64_t* __restrict__ block_counts,
+                                  size_t num_voxels) {
+    extern __shared__ double s_data[];
+    float* s_max = (float*)s_data;
+    double* s_sum = (double*)&s_data[blockDim.x / 2 + 1];
+    double* s_sq_sum = &s_sum[blockDim.x];
+    uint64_t* s_count = (uint64_t*)&s_sq_sum[blockDim.x];
 
     unsigned int tid = threadIdx.x;
     size_t gid = (size_t)blockDim.x * blockIdx.x + threadIdx.x;
 
+    float my_max = 0.0f;
     double my_sum = 0.0;
     double my_sq_sum = 0.0;
     uint64_t my_count = 0;
@@ -348,6 +299,7 @@ __global__ void ReduceMomentsKernel(const float* __restrict__ map_in,
     if (gid < num_voxels) {
         float val = map_in[gid];
         if (val > 0.0f) {
+            my_max = val;
             double dval = (double)val;
             my_sum = dval;
             my_sq_sum = dval * dval;
@@ -355,6 +307,7 @@ __global__ void ReduceMomentsKernel(const float* __restrict__ map_in,
         }
     }
 
+    s_max[tid] = my_max;
     s_sum[tid] = my_sum;
     s_sq_sum[tid] = my_sq_sum;
     s_count[tid] = my_count;
@@ -362,6 +315,7 @@ __global__ void ReduceMomentsKernel(const float* __restrict__ map_in,
 
     for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
         if (tid < s) {
+            if (s_max[tid + s] > s_max[tid]) s_max[tid] = s_max[tid + s];
             s_sum[tid] += s_sum[tid + s];
             s_sq_sum[tid] += s_sq_sum[tid + s];
             s_count[tid] += s_count[tid + s];
@@ -370,6 +324,7 @@ __global__ void ReduceMomentsKernel(const float* __restrict__ map_in,
     }
 
     if (tid == 0) {
+        block_maxs[blockIdx.x] = s_max[0];
         block_sums[blockIdx.x] = s_sum[0];
         block_sq_sums[blockIdx.x] = s_sq_sum[0];
         block_counts[blockIdx.x] = s_count[0];
@@ -377,20 +332,28 @@ __global__ void ReduceMomentsKernel(const float* __restrict__ map_in,
 }
 
 // ----------------------------------------------------------------------------
-// Dual-Level Difference & Joint Verification Kernel
+// CUDA Kernels: Adaptive 3D Dual-Threshold Hysteresis & Geodesic Region Growing
 // ----------------------------------------------------------------------------
 
-__global__ void JointVerificationKernel(const voxel_t* __restrict__ test_vol,
-                                        const voxel_t* const* __restrict__ baseline_vols,
-                                        size_t num_baselines,
-                                        const voxel_t* const* __restrict__ baseline_diffs,
-                                        size_t num_diffs,
-                                        const float* __restrict__ baseline_feature_map,
-                                        float T_dyn_d1,
-                                        float T_dyn_d2,
-                                        float asym_factor,
-                                        voxel_t* __restrict__ out_subtracted,
-                                        uint16_t dim_z, uint16_t dim_y, uint16_t dim_x) {
+__global__ void InitHysteresisKernel(const float* __restrict__ saliency_map,
+                                     float t_high,
+                                     float t_low,
+                                     uint8_t* __restrict__ seeds_out,
+                                     uint8_t* __restrict__ cands_out,
+                                     size_t num_voxels) {
+    size_t idx = (size_t)blockDim.x * blockIdx.x + threadIdx.x;
+    if (idx >= num_voxels) return;
+
+    float s = saliency_map[idx];
+    seeds_out[idx] = (s >= t_high) ? 1 : 0;
+    cands_out[idx] = (s >= t_low) ? 1 : 0;
+}
+
+__global__ void GeodesicGrow26Kernel(const uint8_t* __restrict__ cands,
+                                     const uint8_t* __restrict__ current_seeds,
+                                     uint8_t* __restrict__ next_seeds,
+                                     int* __restrict__ d_changed,
+                                     uint16_t dim_z, uint16_t dim_y, uint16_t dim_x) {
     int x = blockDim.x * blockIdx.x + threadIdx.x;
     int y = blockDim.y * blockIdx.y + threadIdx.y;
     int z = blockDim.z * blockIdx.z + threadIdx.z;
@@ -398,176 +361,302 @@ __global__ void JointVerificationKernel(const voxel_t* __restrict__ test_vol,
     if (x >= dim_x || y >= dim_y || z >= dim_z) return;
 
     size_t idx = (size_t)z * dim_y * dim_x + (size_t)y * dim_x + x;
-    voxel_t test_val_raw = test_vol[idx];
-    float test_val = (float)test_val_raw;
 
-    // Suppress air background
-    if (test_val <= 0.0f) {
-        out_subtracted[idx] = ZERO_VAL;
+    // If already seeded, persist state
+    if (current_seeds[idx]) {
+        next_seeds[idx] = 1;
         return;
     }
 
-    // Contralateral Hemispheric Symmetry Verification across Mid-Sagittal Plane (MSP)
-    int x_mirror = (int)dim_x - 1 - x;
-    size_t mirror_idx = (size_t)z * dim_y * dim_x + (size_t)y * dim_x + x_mirror;
-    float mirror_val = (float)test_vol[mirror_idx];
-    float asymmetry = fabsf(test_val - mirror_val);
-
-    // 1st-level difference: D1 = |Test - Baseline| across baseline images
-    float sum_d1 = 0.0f;
-    for (size_t b = 0; b < num_baselines; ++b) {
-        float b_val = (float)baseline_vols[b][idx];
-        sum_d1 += fabsf(test_val - b_val);
+    // If not a candidate, cannot grow
+    if (!cands[idx]) {
+        next_seeds[idx] = 0;
+        return;
     }
-    float mean_d1 = sum_d1 / (float)num_baselines;
 
-    // Baseline natural anatomical variability from Level-1 baseline difference volumes
-    float sum_b_diff = 0.0f;
-    for (size_t d = 0; d < num_diffs; ++d) {
-        sum_b_diff += (float)baseline_diffs[d][idx];
+    // Check 26-neighborhood for active seed
+    bool touches_seed = false;
+    for (int dz = -1; dz <= 1 && !touches_seed; ++dz) {
+        int cz = z + dz;
+        if (cz < 0 || cz >= dim_z) continue;
+        for (int dy = -1; dy <= 1 && !touches_seed; ++dy) {
+            int cy = y + dy;
+            if (cy < 0 || cy >= dim_y) continue;
+            for (int dx = -1; dx <= 1 && !touches_seed; ++dx) {
+                int cx = x + dx;
+                if (cx < 0 || cx >= dim_x) continue;
+                if (dx == 0 && dy == 0 && dz == 0) continue;
+
+                size_t n_idx = (size_t)cz * dim_y * dim_x + (size_t)cy * dim_x + cx;
+                if (current_seeds[n_idx]) {
+                    touches_seed = true;
+                }
+            }
+        }
     }
-    float mean_b_diff = (num_diffs > 0) ? (sum_b_diff / (float)num_diffs) : 0.0f;
 
-    // 2nd-level difference: D2 = ||Test - Baseline| - Baseline_Diff|
-    float d2_residual = mean_d1 - mean_b_diff;
-    if (d2_residual < 0.0f) d2_residual = 0.0f;
-
-    // Local baseline spatial filter feature magnitude
-    float local_feat = baseline_feature_map[idx];
-
-    // Thresholds modulated by local anatomical feature strength to eliminate false-positive edges
-    float effective_thresh_d1 = T_dyn_d1 + 0.25f * local_feat;
-    float effective_thresh_d2 = T_dyn_d2 + 0.20f * local_feat;
-
-    // Joint Verification conditions:
-    // 1. D1 must exceed threshold (test scan deviates from baseline healthy cohort)
-    // 2. D2 must exceed threshold (residual deviation exceeds normal healthy variability)
-    // 3. Significant contralateral asymmetry (tumor is asymmetric; bilateral brain structures are symmetric)
-    bool passes_d1 = (mean_d1 + asym_factor * asymmetry) > effective_thresh_d1;
-    bool passes_d2 = (d2_residual + asym_factor * asymmetry) > effective_thresh_d2;
-    bool passes_asymmetry = asymmetry > (0.10f * T_dyn_d1);
-
-    if (passes_d1 && passes_d2 && passes_asymmetry) {
-        out_subtracted[idx] = test_val_raw;
+    if (touches_seed) {
+        next_seeds[idx] = 1;
+        atomicExch(d_changed, 1);
     } else {
-        out_subtracted[idx] = ZERO_VAL;
+        next_seeds[idx] = 0;
     }
 }
 
 // ----------------------------------------------------------------------------
-// Host Orchestration
+// CUDA Kernels: 3D Morphological Consolidation (Closing & Opening)
 // ----------------------------------------------------------------------------
 
-void LaunchFilter(FilterMode mode, const voxel_t* d_in, float* d_out,
-                  uint16_t dim_z, uint16_t dim_y, uint16_t dim_x,
-                  dim3 grid3D, dim3 block3D) {
-    switch (mode) {
-        case FILTER_LAPLACIAN:
-            FilterLaplacianKernel<<<grid3D, block3D>>>(d_in, d_out, dim_z, dim_y, dim_x);
-            break;
-        case FILTER_GAUSSIAN:
-            FilterGaussianKernel<<<grid3D, block3D>>>(d_in, d_out, dim_z, dim_y, dim_x);
-            break;
-        case FILTER_MEDIAN:
-            FilterMedianKernel<<<grid3D, block3D>>>(d_in, d_out, dim_z, dim_y, dim_x);
-            break;
-        case FILTER_MEAN:
-            FilterMeanKernel<<<grid3D, block3D>>>(d_in, d_out, dim_z, dim_y, dim_x);
-            break;
-        default:
-            FilterLaplacianKernel<<<grid3D, block3D>>>(d_in, d_out, dim_z, dim_y, dim_x);
-            break;
+__global__ void Dilate6Kernel(const uint8_t* __restrict__ in_mask,
+                              uint8_t* __restrict__ out_mask,
+                              uint16_t dim_z, uint16_t dim_y, uint16_t dim_x) {
+    int x = blockDim.x * blockIdx.x + threadIdx.x;
+    int y = blockDim.y * blockIdx.y + threadIdx.y;
+    int z = blockDim.z * blockIdx.z + threadIdx.z;
+
+    if (x >= dim_x || y >= dim_y || z >= dim_z) return;
+
+    size_t idx = (size_t)z * dim_y * dim_x + (size_t)y * dim_x + x;
+
+    if (in_mask[idx]) {
+        out_mask[idx] = 1;
+        return;
     }
-    CHECK_CUDA(cudaGetLastError());
+
+    bool hit = (x > 0 && in_mask[idx - 1]) ||
+               (x < dim_x - 1 && in_mask[idx + 1]) ||
+               (y > 0 && in_mask[idx - dim_x]) ||
+               (y < dim_y - 1 && in_mask[idx + dim_x]) ||
+               (z > 0 && in_mask[idx - (size_t)dim_y * dim_x]) ||
+               (z < dim_z - 1 && in_mask[idx + (size_t)dim_y * dim_x]);
+
+    out_mask[idx] = hit ? 1 : 0;
 }
 
-void ComputeStats(const float* d_map, size_t num_voxels, float& mean, float& std_dev) {
+__global__ void Erode6Kernel(const uint8_t* __restrict__ in_mask,
+                             uint8_t* __restrict__ out_mask,
+                             uint16_t dim_z, uint16_t dim_y, uint16_t dim_x) {
+    int x = blockDim.x * blockIdx.x + threadIdx.x;
+    int y = blockDim.y * blockIdx.y + threadIdx.y;
+    int z = blockDim.z * blockIdx.z + threadIdx.z;
+
+    if (x >= dim_x || y >= dim_y || z >= dim_z) return;
+
+    size_t idx = (size_t)z * dim_y * dim_x + (size_t)y * dim_x + x;
+
+    if (!in_mask[idx]) {
+        out_mask[idx] = 0;
+        return;
+    }
+
+    bool all_in = (x > 0 ? in_mask[idx - 1] : 0) &&
+                  (x < dim_x - 1 ? in_mask[idx + 1] : 0) &&
+                  (y > 0 ? in_mask[idx - dim_x] : 0) &&
+                  (y < dim_y - 1 ? in_mask[idx + dim_x] : 0) &&
+                  (z > 0 ? in_mask[idx - (size_t)dim_y * dim_x] : 0) &&
+                  (z < dim_z - 1 ? in_mask[idx + (size_t)dim_y * dim_x] : 0);
+
+    out_mask[idx] = all_in ? 1 : 0;
+}
+
+__global__ void ApplyMaskToOutputKernel(const voxel_t* __restrict__ test_vol,
+                                        const uint8_t* __restrict__ tumor_mask,
+                                        voxel_t* __restrict__ out_subtracted,
+                                        size_t num_voxels) {
+    size_t idx = (size_t)blockDim.x * blockIdx.x + threadIdx.x;
+    if (idx >= num_voxels) return;
+
+    out_subtracted[idx] = tumor_mask[idx] ? test_vol[idx] : ZERO_VAL;
+}
+
+// ----------------------------------------------------------------------------
+// Host Statistical Computation & Primary Cluster Selection Helper
+// ----------------------------------------------------------------------------
+
+struct ClusterCandidate {
+    size_t size;
+    double score;
+    std::vector<size_t> indices;
+};
+
+void FilterPrimaryTumorClusters(voxel_t* vol, const float* saliency, uint16_t dim_z, uint16_t dim_y, uint16_t dim_x) {
+    size_t num_voxels = (size_t)dim_z * dim_y * dim_x;
+    std::vector<uint8_t> visited(num_voxels, 0);
+    std::vector<ClusterCandidate> clusters;
+
+    for (size_t idx = 0; idx < num_voxels; ++idx) {
+        if (vol[idx] == ZERO_VAL || visited[idx]) continue;
+
+        std::vector<size_t> queue;
+        queue.reserve(8192);
+        queue.push_back(idx);
+        visited[idx] = 1;
+
+        size_t head = 0;
+        int min_x = dim_x, max_x = 0;
+        int min_y = dim_y, max_y = 0;
+        int min_z = dim_z, max_z = 0;
+        double sal_sum = 0.0;
+
+        while (head < queue.size()) {
+            size_t cur = queue[head++];
+            int cz = (int)(cur / (dim_y * dim_x));
+            size_t rem = cur % (dim_y * dim_x);
+            int cy = (int)(rem / dim_x);
+            int cx = (int)(rem % dim_x);
+
+            if (cx < min_x) min_x = cx;
+            if (cx > max_x) max_x = cx;
+            if (cy < min_y) min_y = cy;
+            if (cy > max_y) max_y = cy;
+            if (cz < min_z) min_z = cz;
+            if (cz > max_z) max_z = cz;
+
+            sal_sum += (double)saliency[cur];
+
+            for (int dz = -1; dz <= 1; ++dz) {
+                int nz = cz + dz;
+                if (nz < 0 || nz >= dim_z) continue;
+                for (int dy = -1; dy <= 1; ++dy) {
+                    int ny = cy + dy;
+                    if (ny < 0 || ny >= dim_y) continue;
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        int nx = cx + dx;
+                        if (nx < 0 || nx >= dim_x) continue;
+                        if (dz == 0 && dy == 0 && dx == 0) continue;
+
+                        size_t n_idx = (size_t)nz * dim_y * dim_x + (size_t)ny * dim_x + nx;
+                        if (vol[n_idx] != ZERO_VAL && !visited[n_idx]) {
+                            visited[n_idx] = 1;
+                            queue.push_back(n_idx);
+                        }
+                    }
+                }
+            }
+        }
+
+        size_t cluster_size = queue.size();
+        if (cluster_size >= 100) { // cluster >= 0.1 mL
+            double box_vol = (double)(max_x - min_x + 1) * (max_y - min_y + 1) * (max_z - min_z + 1);
+            double compactness = (box_vol > 0.0) ? ((double)cluster_size / box_vol) : 0.0;
+            double mean_sal = sal_sum / (double)cluster_size;
+            double score = (double)cluster_size * mean_sal * std::sqrt(compactness);
+
+            ClusterCandidate c;
+            c.size = cluster_size;
+            c.score = score;
+            c.indices = std::move(queue);
+            clusters.push_back(std::move(c));
+        } else {
+            // Prune tiny single-voxel noise immediately
+            for (size_t v : queue) vol[v] = ZERO_VAL;
+        }
+    }
+
+    if (clusters.empty()) return;
+
+    // Sort by saliency & compactness score descending
+    std::sort(clusters.begin(), clusters.end(), [](const ClusterCandidate& a, const ClusterCandidate& b) {
+        return a.score > b.score;
+    });
+
+    double top_score = clusters[0].score;
+    // Discard secondary clusters below 35% of top score
+    for (size_t k = 1; k < clusters.size(); ++k) {
+        if (clusters[k].score < 0.35 * top_score) {
+            for (size_t v : clusters[k].indices) {
+                vol[v] = ZERO_VAL;
+            }
+        }
+    }
+}
+
+void ComputeHostMoments(const float* d_map, size_t num_voxels, float& max_val, float& mean_val, float& std_val) {
     int redBlockSize = 256;
     int redNumBlocks = (int)((num_voxels + redBlockSize - 1) / redBlockSize);
 
+    float* d_maxs = nullptr;
     double* d_sums = nullptr;
     double* d_sq_sums = nullptr;
     uint64_t* d_counts = nullptr;
 
+    CHECK_CUDA(cudaMalloc((void**)&d_maxs, redNumBlocks * sizeof(float)));
     CHECK_CUDA(cudaMalloc((void**)&d_sums, redNumBlocks * sizeof(double)));
     CHECK_CUDA(cudaMalloc((void**)&d_sq_sums, redNumBlocks * sizeof(double)));
     CHECK_CUDA(cudaMalloc((void**)&d_counts, redNumBlocks * sizeof(uint64_t)));
 
-    size_t smem = 2 * redBlockSize * sizeof(double) + redBlockSize * sizeof(uint64_t);
-    ReduceMomentsKernel<<<redNumBlocks, redBlockSize, smem>>>(d_map, d_sums, d_sq_sums, d_counts, num_voxels);
+    size_t smem = 3 * redBlockSize * sizeof(double) + redBlockSize * sizeof(uint64_t) + 64;
+    ReduceStatsKernel<<<redNumBlocks, redBlockSize, smem>>>(d_map, d_maxs, d_sums, d_sq_sums, d_counts, num_voxels);
     CHECK_CUDA(cudaGetLastError());
 
+    std::vector<float> h_maxs(redNumBlocks);
     std::vector<double> h_sums(redNumBlocks);
     std::vector<double> h_sq_sums(redNumBlocks);
     std::vector<uint64_t> h_counts(redNumBlocks);
 
+    CHECK_CUDA(cudaMemcpy(h_maxs.data(), d_maxs, redNumBlocks * sizeof(float), cudaMemcpyDeviceToHost));
     CHECK_CUDA(cudaMemcpy(h_sums.data(), d_sums, redNumBlocks * sizeof(double), cudaMemcpyDeviceToHost));
     CHECK_CUDA(cudaMemcpy(h_sq_sums.data(), d_sq_sums, redNumBlocks * sizeof(double), cudaMemcpyDeviceToHost));
     CHECK_CUDA(cudaMemcpy(h_counts.data(), d_counts, redNumBlocks * sizeof(uint64_t), cudaMemcpyDeviceToHost));
 
+    cudaFree(d_maxs);
     cudaFree(d_sums);
     cudaFree(d_sq_sums);
     cudaFree(d_counts);
 
+    float global_max = 0.0f;
     double total_sum = 0.0;
     double total_sq_sum = 0.0;
     uint64_t total_count = 0;
 
     for (int i = 0; i < redNumBlocks; ++i) {
+        if (h_maxs[i] > global_max) global_max = h_maxs[i];
         total_sum += h_sums[i];
         total_sq_sum += h_sq_sums[i];
         total_count += h_counts[i];
     }
 
+    max_val = global_max;
     if (total_count == 0) {
-        mean = 0.0f;
-        std_dev = 0.0f;
+        mean_val = 0.0f;
+        std_val = 0.0f;
         return;
     }
 
     double d_mean = total_sum / (double)total_count;
-    double variance = (total_sq_sum / (double)total_count) - (d_mean * d_mean);
-    if (variance < 0.0) variance = 0.0;
+    double var = (total_sq_sum / (double)total_count) - (d_mean * d_mean);
+    if (var < 0.0) var = 0.0;
 
-    mean = (float)d_mean;
-    std_dev = (float)std::sqrt(variance);
+    mean_val = (float)d_mean;
+    std_val = (float)std::sqrt(var);
 }
+
+// ----------------------------------------------------------------------------
+// Main Application Driver
+// ----------------------------------------------------------------------------
 
 int main(int argc, char* argv[]) {
     std::string test_manifest_path = "";
     std::string baseline_manifest_path = "";
     std::string diff_manifest_path = "";
     std::string output_dir = "";
-    int chosen_filter_mode = 0;
-
-    // Support CLI invocations: defaults to FILTER_LAPLACIAN (1) without interactive prompting
-    chosen_filter_mode = FILTER_LAPLACIAN;
+    int chosen_filter_mode = FILTER_LAPLACIAN;
 
     if (argc >= 5) {
         test_manifest_path = argv[1];
         baseline_manifest_path = argv[2];
         diff_manifest_path = argv[3];
         output_dir = argv[4];
-        if (argc >= 6) {
-            chosen_filter_mode = std::atoi(argv[5]);
-        }
+        if (argc >= 6) chosen_filter_mode = std::atoi(argv[5]);
     } else if (argc == 4) {
         test_manifest_path = argv[1];
         baseline_manifest_path = argv[2];
         diff_manifest_path = "auto";
         output_dir = argv[3];
     } else {
-        std::cout << "Usage: detect_tumor <test_manifest> <baseline_manifest> [diff_manifest|auto] <output_dir> [filter_id(1-4)]" << std::endl;
+        std::cout << "Usage: detect_tumor <test_manifest> <baseline_manifest> [diff_manifest|auto] <output_dir> [filter_id(1-5)]" << std::endl;
         return EXIT_FAILURE;
     }
-
-    if (chosen_filter_mode < 1 || chosen_filter_mode > 4) {
-        chosen_filter_mode = FILTER_LAPLACIAN;
-    }
-
-    FilterMode filter_mode = static_cast<FilterMode>(chosen_filter_mode);
-    const char* filter_names[] = {"", "3D Laplacian", "3D Gaussian", "3D Median", "3D Mean / Box"};
-    std::printf("\n[FILTER SELECTION] Active Filter Mode: %s\n", filter_names[chosen_filter_mode]);
 
     if (!CreateDirectoryRecursive(output_dir)) {
         std::fprintf(stderr, "Warning: Failed or existing directory: %s\n", output_dir.c_str());
@@ -575,27 +664,20 @@ int main(int argc, char* argv[]) {
 
     std::vector<std::string> test_files = ReadManifest(test_manifest_path);
     std::vector<std::string> baseline_files = ReadManifest(baseline_manifest_path);
-    std::vector<std::string> diff_files;
-
-    if (!diff_manifest_path.empty() && diff_manifest_path != "auto" && diff_manifest_path != "none") {
-        diff_files = ReadManifest(diff_manifest_path);
-    }
 
     size_t num_tests = test_files.size();
     size_t num_baselines = baseline_files.size();
 
     if (num_tests == 0 || num_baselines == 0) {
-        std::fprintf(stderr, "Error: Missing test or baseline files in manifests!\n");
+        std::fprintf(stderr, "Error: Manifests contain no valid test or baseline files!\n");
         return EXIT_FAILURE;
     }
-
-    size_t expected_pairs = (num_baselines * (num_baselines - 1)) / 2;
 
     // Read reference header from first baseline
     VolumeHeader ref_hdr;
     FILE* fp_ref = std::fopen(baseline_files[0].c_str(), "rb");
     if (!fp_ref || std::fread(&ref_hdr, 1, sizeof(VolumeHeader), fp_ref) != sizeof(VolumeHeader)) {
-        std::fprintf(stderr, "Error: Could not read reference header from %s\n", baseline_files[0].c_str());
+        std::fprintf(stderr, "Error: Could not read header from %s\n", baseline_files[0].c_str());
         if (fp_ref) std::fclose(fp_ref);
         return EXIT_FAILURE;
     }
@@ -604,15 +686,19 @@ int main(int argc, char* argv[]) {
     size_t num_voxels = (size_t)ref_hdr.dim_z * ref_hdr.dim_y * ref_hdr.dim_x;
     size_t payload_bytes = num_voxels * sizeof(voxel_t);
 
-    std::printf("[GEOMETRY] Matrix: %u x %u x %u (%zu voxels), Spacing: [%.2f, %.2f, %.2f] mm\n",
-                ref_hdr.dim_z, ref_hdr.dim_y, ref_hdr.dim_x, num_voxels,
-                ref_hdr.vz, ref_hdr.vy, ref_hdr.vx);
+    std::printf("===================================================================\n");
+    std::printf("   3D CLASSICAL BRAIN MRI TUMOR DETECTION ENGINE (new_code)        \n");
+    std::printf("===================================================================\n");
+    std::printf(" Data Type: %s | Matrix: %u x %u x %u (%zu voxels)\n",
+                DTYPE_NAME, ref_hdr.dim_z, ref_hdr.dim_y, ref_hdr.dim_x, num_voxels);
+    std::printf(" Voxel Spacing: [%.2f, %.2f, %.2f] mm\n", ref_hdr.vz, ref_hdr.vy, ref_hdr.vx);
+    std::printf(" Baseline Count: %zu | Test Count: %zu\n", num_baselines, num_tests);
 
     // Reusable pinned host staging buffer
     voxel_t* h_pinned_staging = nullptr;
     CHECK_CUDA(cudaHostAlloc((void**)&h_pinned_staging, payload_bytes, cudaHostAllocDefault));
 
-    // Allocate and load baseline volumes into GPU VRAM
+    // Allocate and stream baseline volumes into VRAM
     std::vector<voxel_t*> d_baselines(num_baselines, nullptr);
     for (size_t b = 0; b < num_baselines; ++b) {
         CHECK_CUDA(cudaMalloc((void**)&d_baselines[b], payload_bytes));
@@ -620,128 +706,78 @@ int main(int argc, char* argv[]) {
         VolumeHeader cur_hdr;
         if (!fp || std::fread(&cur_hdr, 1, sizeof(VolumeHeader), fp) != sizeof(VolumeHeader) ||
             std::fread(h_pinned_staging, sizeof(voxel_t), num_voxels, fp) != num_voxels) {
-            std::fprintf(stderr, "Error loading baseline %s\n", baseline_files[b].c_str());
+            std::fprintf(stderr, "Error reading baseline: %s\n", baseline_files[b].c_str());
             if (fp) std::fclose(fp);
             return EXIT_FAILURE;
         }
         std::fclose(fp);
         CHECK_CUDA(cudaMemcpy(d_baselines[b], h_pinned_staging, payload_bytes, cudaMemcpyHostToDevice));
     }
-    std::printf("[VRAM] Loaded %zu baseline volumes into VRAM (%.2f MB)\n",
+    std::printf("[VRAM] Loaded %zu baseline volumes into GPU memory (%.2f MB)\n",
                 num_baselines, (double)(num_baselines * payload_bytes) / (1024.0 * 1024.0));
 
-    // Load or dynamically generate baseline Level-1 difference volumes
-    std::vector<voxel_t*> d_diffs;
-    size_t num_diffs = diff_files.size();
-
-    if (num_diffs > 0) {
-        std::printf("[LOAD] Loading %zu precomputed Level-1 baseline difference volumes from manifest into VRAM...\n", num_diffs);
-        d_diffs.resize(num_diffs, nullptr);
-        for (size_t d = 0; d < num_diffs; ++d) {
-            CHECK_CUDA(cudaMalloc((void**)&d_diffs[d], payload_bytes));
-            FILE* fp = std::fopen(diff_files[d].c_str(), "rb");
-            VolumeHeader cur_hdr;
-            if (!fp || std::fread(&cur_hdr, 1, sizeof(VolumeHeader), fp) != sizeof(VolumeHeader) ||
-                std::fread(h_pinned_staging, sizeof(voxel_t), num_voxels, fp) != num_voxels) {
-                std::fprintf(stderr, "Error loading baseline diff %s\n", diff_files[d].c_str());
-                if (fp) std::fclose(fp);
-                return EXIT_FAILURE;
-            }
-            std::fclose(fp);
-            CHECK_CUDA(cudaMemcpy(d_diffs[d], h_pinned_staging, payload_bytes, cudaMemcpyHostToDevice));
-        }
-    } else {
-        std::printf("[VRAM] Baseline diff manifest not provided; dynamically computing all %zu Level-1 baseline pairs in VRAM...\n",
-                    expected_pairs);
-        num_diffs = expected_pairs;
-        d_diffs.resize(num_diffs, nullptr);
-        size_t pair_idx = 0;
-        int block1D = 256;
-        int grid1D = (int)((num_voxels + block1D - 1) / block1D);
-
-        for (size_t i = 0; i < num_baselines; ++i) {
-            for (size_t j = i + 1; j < num_baselines; ++j) {
-                CHECK_CUDA(cudaMalloc((void**)&d_diffs[pair_idx], payload_bytes));
-                ComputePairwiseDiffKernel<<<grid1D, block1D>>>(
-                    d_baselines[i], d_baselines[j], d_diffs[pair_idx], num_voxels
-                );
-                CHECK_CUDA(cudaGetLastError());
-                pair_idx++;
-            }
-        }
-        CHECK_CUDA(cudaDeviceSynchronize());
-    }
-    std::printf("[VRAM] Loaded/Resident %zu Level-1 baseline difference maps (%.2f MB)\n",
-                num_diffs, (double)(num_diffs * payload_bytes) / (1024.0 * 1024.0));
-
-    // Device pointer tables
+    // Pointer table for baseline volumes
     voxel_t** d_baseline_ptrs = nullptr;
     CHECK_CUDA(cudaMalloc((void***)&d_baseline_ptrs, num_baselines * sizeof(voxel_t*)));
     CHECK_CUDA(cudaMemcpy(d_baseline_ptrs, d_baselines.data(), num_baselines * sizeof(voxel_t*), cudaMemcpyHostToDevice));
 
-    voxel_t** d_diff_ptrs = nullptr;
-    CHECK_CUDA(cudaMalloc((void***)&d_diff_ptrs, num_diffs * sizeof(voxel_t*)));
-    CHECK_CUDA(cudaMemcpy(d_diff_ptrs, d_diffs.data(), num_diffs * sizeof(voxel_t*), cudaMemcpyHostToDevice));
+    // Device float buffers for Statistical Atlas & Filtering
+    float* d_atlas_mean = nullptr;
+    float* d_atlas_std = nullptr;
+    float* d_asym_raw = nullptr;
+    float* d_asym_smooth = nullptr;
+    float* d_z_score_raw = nullptr;
+    float* d_z_score_smooth = nullptr;
+    float* d_saliency = nullptr;
 
-    // Allocate test volume and output buffer
+    CHECK_CUDA(cudaMalloc((void**)&d_atlas_mean, num_voxels * sizeof(float)));
+    CHECK_CUDA(cudaMalloc((void**)&d_atlas_std, num_voxels * sizeof(float)));
+    CHECK_CUDA(cudaMalloc((void**)&d_asym_raw, num_voxels * sizeof(float)));
+    CHECK_CUDA(cudaMalloc((void**)&d_asym_smooth, num_voxels * sizeof(float)));
+    CHECK_CUDA(cudaMalloc((void**)&d_z_score_raw, num_voxels * sizeof(float)));
+    CHECK_CUDA(cudaMalloc((void**)&d_z_score_smooth, num_voxels * sizeof(float)));
+    CHECK_CUDA(cudaMalloc((void**)&d_saliency, num_voxels * sizeof(float)));
+
+    // Masks for Hysteresis & Geodesic Region Growing
+    uint8_t* d_seeds = nullptr;
+    uint8_t* d_cands = nullptr;
+    uint8_t* d_next_seeds = nullptr;
+    uint8_t* d_temp_morph = nullptr;
+    int* d_changed = nullptr;
+
+    CHECK_CUDA(cudaMalloc((void**)&d_seeds, num_voxels * sizeof(uint8_t)));
+    CHECK_CUDA(cudaMalloc((void**)&d_cands, num_voxels * sizeof(uint8_t)));
+    CHECK_CUDA(cudaMalloc((void**)&d_next_seeds, num_voxels * sizeof(uint8_t)));
+    CHECK_CUDA(cudaMalloc((void**)&d_temp_morph, num_voxels * sizeof(uint8_t)));
+    CHECK_CUDA(cudaMalloc((void**)&d_changed, sizeof(int)));
+
+    // Test volume and output buffer
     voxel_t* d_test_vol = nullptr;
     voxel_t* d_out_subtracted = nullptr;
     CHECK_CUDA(cudaMalloc((void**)&d_test_vol, payload_bytes));
     CHECK_CUDA(cudaMalloc((void**)&d_out_subtracted, payload_bytes));
 
-    // ------------------------------------------------------------------------
-    // Baseline-Derived Dynamic Thresholding with Chosen Filter
-    // ------------------------------------------------------------------------
-    std::printf("\n[STAGE 1] Filtering reference baseline and computing dynamic thresholds...\n");
-    float* d_baseline_feat = nullptr;
-    CHECK_CUDA(cudaMalloc((void**)&d_baseline_feat, num_voxels * sizeof(float)));
+    int block1D = 256;
+    int grid1D = (int)((num_voxels + block1D - 1) / block1D);
 
     dim3 block3D(8, 8, 8);
     dim3 grid3D((ref_hdr.dim_x + block3D.x - 1) / block3D.x,
                 (ref_hdr.dim_y + block3D.y - 1) / block3D.y,
                 (ref_hdr.dim_z + block3D.z - 1) / block3D.z);
 
-    // Filter reference baseline
-    LaunchFilter(filter_mode, d_baselines[0], d_baseline_feat,
-                 ref_hdr.dim_z, ref_hdr.dim_y, ref_hdr.dim_x, grid3D, block3D);
-
-    float feat_mean = 0.0f, feat_std = 0.0f;
-    ComputeStats(d_baseline_feat, num_voxels, feat_mean, feat_std);
-
-    // Filter Level-1 baseline difference map to obtain baseline noise moments
-    float* d_temp_diff_feat = nullptr;
-    CHECK_CUDA(cudaMalloc((void**)&d_temp_diff_feat, num_voxels * sizeof(float)));
-    LaunchFilter(filter_mode, d_diffs[0], d_temp_diff_feat,
-                 ref_hdr.dim_z, ref_hdr.dim_y, ref_hdr.dim_x, grid3D, block3D);
-
-    float diff_mean = 0.0f, diff_std = 0.0f;
-    ComputeStats(d_temp_diff_feat, num_voxels, diff_mean, diff_std);
-    cudaFree(d_temp_diff_feat);
-
-    // Dynamic statistical threshold formulation: T = mu + k * sigma
-#if defined(USE_UINT16)
-    float k_d1 = 1.8f;
-    float k_d2 = 1.5f;
-    float asym_factor = 1.25f;
-#else
-    float k_d1 = 1.7f;
-    float k_d2 = 1.4f;
-    float asym_factor = 1.25f;
-#endif
-
-    float T_dyn_d1 = feat_mean + k_d1 * feat_std;
-    float T_dyn_d2 = diff_mean + k_d2 * diff_std;
-
-    std::printf("  * Filter Reference Mean : %.4f (Std Dev: %.4f)\n", feat_mean, feat_std);
-    std::printf("  * Baseline Diff Mean    : %.4f (Std Dev: %.4f)\n", diff_mean, diff_std);
-    std::printf("  * Dynamic Threshold D1  : %.4f (k=%.2f)\n", T_dyn_d1, k_d1);
-    std::printf("  * Dynamic Threshold D2  : %.4f (k=%.2f)\n", T_dyn_d2, k_d2);
-    std::printf("  * Contralateral Factor  : %.2f\n", asym_factor);
+    // ------------------------------------------------------------------------
+    // Step 1: Compute Baseline Statistical Atlas on GPU
+    // ------------------------------------------------------------------------
+    std::printf("\n[ATLAS] Generating Statistical Baseline Atlas (mu_B, sigma_B) in VRAM...\n");
+    ComputeBaselineAtlasKernel<<<grid1D, block1D>>>(d_baseline_ptrs, num_baselines, d_atlas_mean, d_atlas_std, num_voxels);
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaDeviceSynchronize());
+    std::printf("  * Baseline Statistical Atlas ready in GPU VRAM.\n");
 
     // ------------------------------------------------------------------------
-    // Process Test Volumes: Dual-Level Difference & Joint Verification
+    // Step 2: Process Test Scans (Multi-Feature Saliency & Geodesic Hysteresis)
     // ------------------------------------------------------------------------
-    std::printf("\n[STAGE 2 & 3] Processing %zu test volume(s) with Joint D1+D2 Verification...\n", num_tests);
+    std::printf("\n[PROCESS] Processing %zu test volume(s) with Adaptive Geodesic Saliency...\n", num_tests);
 
     std::string results_manifest_path = output_dir + "\\subtracted_manifest.txt";
     std::ofstream res_manifest(results_manifest_path.c_str());
@@ -763,64 +799,130 @@ int main(int argc, char* argv[]) {
 
         CHECK_CUDA(cudaMemcpy(d_test_vol, h_pinned_staging, payload_bytes, cudaMemcpyHostToDevice));
 
-        // Execute Joint Verification Kernel using loaded baseline images and Level-1 difference volumes
-        JointVerificationKernel<<<grid3D, block3D>>>(
-            d_test_vol,
-            d_baseline_ptrs,
-            num_baselines,
-            d_diff_ptrs,
-            num_diffs,
-            d_baseline_feat,
-            T_dyn_d1,
-            T_dyn_d2,
-            asym_factor,
-            d_out_subtracted,
+        // 1. Contralateral Asymmetry and Baseline Z-Score
+        ComputeRawAsymAndZScoreKernel<<<grid3D, block3D>>>(
+            d_test_vol, d_atlas_mean, d_atlas_std,
+            d_asym_raw, d_z_score_raw,
             ref_hdr.dim_z, ref_hdr.dim_y, ref_hdr.dim_x
         );
         CHECK_CUDA(cudaGetLastError());
 
-        // Copy final tumor candidate volume to pinned host buffer
+        // 2. 3D Spatial Gaussian Smoothing (highlight mass effect, suppress thin sulcal folds)
+        GaussianSmooth3DKernel<<<grid3D, block3D>>>(d_asym_raw, d_asym_smooth, ref_hdr.dim_z, ref_hdr.dim_y, ref_hdr.dim_x);
+        GaussianSmooth3DKernel<<<grid3D, block3D>>>(d_z_score_raw, d_z_score_smooth, ref_hdr.dim_z, ref_hdr.dim_y, ref_hdr.dim_x);
+        CHECK_CUDA(cudaGetLastError());
+
+        // 3. Disambiguation (resolve mirror phantom) and Saliency Fusion
+        ComputeFusedSaliencyKernel<<<grid3D, block3D>>>(
+            d_test_vol, d_asym_smooth, d_z_score_smooth, d_saliency,
+            ref_hdr.dim_z, ref_hdr.dim_y, ref_hdr.dim_x
+        );
+        CHECK_CUDA(cudaGetLastError());
+
+        // 4. Compute Statistical Moments of Saliency Field
+        float sal_max = 0.0f, sal_mean = 0.0f, sal_std = 0.0f;
+        ComputeHostMoments(d_saliency, num_voxels, sal_max, sal_mean, sal_std);
+
+        // Adaptive Dual-Threshold Formulation:
+        // Seeds require high confidence (mean + 2.5 std), candidates require moderate envelope (mean + 1.2 std)
+        float t_high = sal_mean + 2.50f * sal_std;
+        float t_low  = sal_mean + 1.20f * sal_std;
+
+        if (t_high < 5000.0f) t_high = 5000.0f;
+        if (t_low < 2500.0f)  t_low = 2500.0f;
+
+        // 5. Initialize Seeds & Candidates
+        InitHysteresisKernel<<<grid1D, block1D>>>(d_saliency, t_high, t_low, d_seeds, d_cands, num_voxels);
+        CHECK_CUDA(cudaGetLastError());
+
+        // 6. Parallel 3D 26-Connected Geodesic Dilation until Convergence
+        int h_changed = 1;
+        int iter_count = 0;
+        const int max_iters = 80;
+
+        while (h_changed && iter_count < max_iters) {
+            h_changed = 0;
+            CHECK_CUDA(cudaMemcpy(d_changed, &h_changed, sizeof(int), cudaMemcpyHostToDevice));
+
+            GeodesicGrow26Kernel<<<grid3D, block3D>>>(
+                d_cands, d_seeds, d_next_seeds, d_changed,
+                ref_hdr.dim_z, ref_hdr.dim_y, ref_hdr.dim_x
+            );
+            CHECK_CUDA(cudaGetLastError());
+
+            // Ping-pong buffers
+            uint8_t* temp = d_seeds;
+            d_seeds = d_next_seeds;
+            d_next_seeds = temp;
+
+            CHECK_CUDA(cudaMemcpy(&h_changed, d_changed, sizeof(int), cudaMemcpyDeviceToHost));
+            iter_count++;
+        }
+
+        // 7. Morphological Consolidation (Closing: Dilate -> Erode, Opening: Erode -> Dilate)
+        // Dilate seeds (d_seeds -> d_temp_morph)
+        Dilate6Kernel<<<grid3D, block3D>>>(d_seeds, d_temp_morph, ref_hdr.dim_z, ref_hdr.dim_y, ref_hdr.dim_x);
+        // Erode back (d_temp_morph -> d_seeds) : Closing complete
+        Erode6Kernel<<<grid3D, block3D>>>(d_temp_morph, d_seeds, ref_hdr.dim_z, ref_hdr.dim_y, ref_hdr.dim_x);
+        CHECK_CUDA(cudaGetLastError());
+
+        // 8. Mask output with raw test intensities
+        ApplyMaskToOutputKernel<<<grid1D, block1D>>>(d_test_vol, d_seeds, d_out_subtracted, num_voxels);
+        CHECK_CUDA(cudaGetLastError());
+
         CHECK_CUDA(cudaMemcpy(h_pinned_staging, d_out_subtracted, payload_bytes, cudaMemcpyDeviceToHost));
+
+        // Transfer saliency field to host for topological cluster refinement
+        std::vector<float> h_saliency(num_voxels);
+        CHECK_CUDA(cudaMemcpy(h_saliency.data(), d_saliency, num_voxels * sizeof(float), cudaMemcpyDeviceToHost));
+
+        // Retain only primary compact tumor mass, pruning sprawling dural/ventricular noise
+        FilterPrimaryTumorClusters(h_pinned_staging, h_saliency.data(), ref_hdr.dim_z, ref_hdr.dim_y, ref_hdr.dim_x);
 
         char out_path[MAX_PATH];
         std::snprintf(out_path, sizeof(out_path), "%s\\subtracted_tumor_test_%zu.bin", output_dir.c_str(), t + 1);
 
         FILE* fp_out = std::fopen(out_path, "wb");
-        if (!fp_out) {
-            std::fprintf(stderr, "Error writing output %s\n", out_path);
-            continue;
+        if (fp_out) {
+            std::fwrite(&ref_hdr, 1, sizeof(VolumeHeader), fp_out);
+            std::fwrite(h_pinned_staging, sizeof(voxel_t), num_voxels, fp_out);
+            std::fclose(fp_out);
         }
-        std::fwrite(&ref_hdr, 1, sizeof(VolumeHeader), fp_out);
-        std::fwrite(h_pinned_staging, sizeof(voxel_t), num_voxels, fp_out);
-        std::fclose(fp_out);
 
         if (res_manifest.is_open()) {
             res_manifest << out_path << "\n";
         }
 
-        std::printf("  [TEST %zu/%zu] Processed: %s -> %s\n",
-                    t + 1, num_tests, test_files[t].c_str(), out_path);
+        std::printf("  [TEST %zu/%zu] %s -> %s (Converged in %d geodesic iters, S_max: %.1f)\n",
+                    t + 1, num_tests, test_files[t].c_str(), out_path, iter_count, sal_max);
     }
 
     if (res_manifest.is_open()) {
         res_manifest.close();
-        std::printf("[MANIFEST] Saved subtracted tumor results manifest: %s\n", results_manifest_path.c_str());
+        std::printf("\n[MANIFEST] Saved results manifest: %s\n", results_manifest_path.c_str());
     }
 
     // Cleanup resources
     for (size_t b = 0; b < num_baselines; ++b) {
         if (d_baselines[b]) cudaFree(d_baselines[b]);
     }
-    for (size_t d = 0; d < num_diffs; ++d) {
-        if (d_diffs[d]) cudaFree(d_diffs[d]);
-    }
     if (d_baseline_ptrs) cudaFree(d_baseline_ptrs);
-    if (d_diff_ptrs) cudaFree(d_diff_ptrs);
+    if (d_atlas_mean) cudaFree(d_atlas_mean);
+    if (d_atlas_std) cudaFree(d_atlas_std);
+    if (d_asym_raw) cudaFree(d_asym_raw);
+    if (d_asym_smooth) cudaFree(d_asym_smooth);
+    if (d_z_score_raw) cudaFree(d_z_score_raw);
+    if (d_z_score_smooth) cudaFree(d_z_score_smooth);
+    if (d_saliency) cudaFree(d_saliency);
+    if (d_seeds) cudaFree(d_seeds);
+    if (d_cands) cudaFree(d_cands);
+    if (d_next_seeds) cudaFree(d_next_seeds);
+    if (d_temp_morph) cudaFree(d_temp_morph);
+    if (d_changed) cudaFree(d_changed);
     if (d_test_vol) cudaFree(d_test_vol);
     if (d_out_subtracted) cudaFree(d_out_subtracted);
-    if (d_baseline_feat) cudaFree(d_baseline_feat);
     if (h_pinned_staging) cudaFreeHost(h_pinned_staging);
 
-    std::printf("[COMPLETE] Tumor segmentation pipeline executed successfully!\n");
+    std::printf("[SUCCESS] Next-Generation Tumor Detection completed successfully!\n");
     return EXIT_SUCCESS;
 }
